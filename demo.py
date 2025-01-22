@@ -1,8 +1,3 @@
-"""
-MoAI-7B
-
-Simple Six Steps
-"""
 
 # [1] Loading Image
 from PIL import Image

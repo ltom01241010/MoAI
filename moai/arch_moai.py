@@ -232,119 +232,148 @@ class MoAIModel(InternLM2PreTrainedModel):
                 "mode": mode}
 
     def demo_process(
-        self,
-        image,
-        prompt,
-        processor,
-        seg_model,
-        seg_processor,
-        od_model,
-        od_processor,
-        sgg_model,
-        ocr_model,
-        device,
-        mode='moai_eval.yaml'):
-
-        # RGB Dimension
-        image = image[:3]
-        
-        # Segmentation Inputs
-        seg_inputs = seg_processor(images=[image], return_tensors="pt")
-
-        # Segmentation Outputs
-        with torch.inference_mode():
-            seg_model.eval()
-            seg_results = seg_processor.post_process_panoptic_segmentation(seg_model(**{k:v.to(device) for k, v in seg_inputs.items()}), 
-                                                                           target_sizes=[(490, 490)],
-                                                                           threshold=0.5,
-                                                                           mask_threshold=0.95,
-                                                                           label_ids_to_fuse=())
-
-
-        # OWOD Inputs
-        from utils.constants import ADE20K_847, IMAGENET_CLASSES
-        od_inputs = od_processor(text=[ADE20K_847+IMAGENET_CLASSES], images=[image], return_tensors="pt")
-
-        # OWOD Outputs
-        with torch.inference_mode():
-            od_model.eval()
-            od_results = od_processor.post_process_object_detection(od_model(**{k:v.to(device) for k, v in od_inputs.items()}), 
-                                                                    threshold=0.1,
-                                                                    target_sizes=[(490, 490)])
+            self,
+            image,
+            prompt,
+            processor,
+            seg_model,
+            seg_processor,
+            od_model,
+            od_processor,
+            sgg_model,
+            ocr_model,
+            device,
+            mode='moai_eval.yaml'):
             
-        # SGG Outputs
-        from mmdet.apis import inference_detector
-        with torch.inference_mode():
-            sgg_results = inference_detector(sgg_model, imgs=[image.permute(1,2,0).cpu().numpy()])
+            # Get model device
+            target_device = next(self.parameters()).device
+            
+            # Ensure image is on the correct device and in the right format
+            image = image[:3].to(target_device)  # Take only RGB channels
+            
+            # Segmentation processing
+            seg_inputs = seg_processor(images=[image], return_tensors="pt")
+            seg_inputs = {k: v.to(target_device) for k, v in seg_inputs.items()}
+            
+            # Segmentation Outputs
+            with torch.inference_mode():
+                seg_model.eval()
+                seg_results = seg_processor.post_process_panoptic_segmentation(
+                    seg_model(**seg_inputs),
+                    target_sizes=[(490, 490)],
+                    threshold=0.5,
+                    mask_threshold=0.95,
+                    label_ids_to_fuse=()
+                )
 
-        # OCR Outputs
-        with torch.inference_mode():
-            ocr_results = ocr_model.ocr(image.permute(1,2,0).cpu().numpy())
+            # OWOD Processing
+            from utils.constants import ADE20K_847, IMAGENET_CLASSES
+            od_inputs = od_processor(
+                text=[ADE20K_847+IMAGENET_CLASSES], 
+                images=[image], 
+                return_tensors="pt"
+            )
+            od_inputs = {k: v.to(target_device) for k, v in od_inputs.items()}
 
+            # OWOD Outputs
+            with torch.inference_mode():
+                od_model.eval()
+                od_results = od_processor.post_process_object_detection(
+                    od_model(**od_inputs),
+                    threshold=0.1,
+                    target_sizes=[(490, 490)]
+                )
+                
+            # SGG Outputs
+            from mmdet.apis import inference_detector
+            with torch.inference_mode():
+                image_cpu = image.permute(1,2,0).cpu().numpy()
+                sgg_results = inference_detector(sgg_model, imgs=[image_cpu])
 
-        # Panoptic Index and Class Index
-        verbalization_seg, panoptic_map, nice_seg_info_list = make_seg_prompt(seg_results[0])
-        
-        # OWOD Detection
-        verbalization_od, od_boxes, od_labels = make_od_prompt(od_results[0])
-        
-        # SGG
-        verbalization_sgg = make_sgg_prompt(sgg_results[0])
-        
-        # OCR
-        verbalization_ocr = make_ocr_prompt(ocr_results[0])
-        
-        # Aux prompt
-        verbalization_aux = make_human_string(verbalization_seg, verbalization_od, verbalization_sgg, verbalization_ocr)
+            # OCR Outputs
+            with torch.inference_mode():
+                ocr_results = ocr_model.ocr(image_cpu)
 
-        # moai prompt prefix
-        moai_prompt, _, im_mask = make_system_prompt(processor, device, self.config.ignore_index)
-        moai_prompt, im_mask = demo_make_and_add_prompt_and_im_mask(moai_prompt=moai_prompt, 
-                                                                    im_mask=im_mask, 
-                                                                    prompt=prompt, 
-                                                                    processor=processor, 
-                                                                    device=device)
-        # lang mask
-        lang_mask = 1 - im_mask
+            # Process results and create prompts
+            verbalization_seg, panoptic_map, nice_seg_info_list = make_seg_prompt(seg_results[0])
+            verbalization_od, od_boxes, od_labels = make_od_prompt(od_results[0])
+            verbalization_sgg = make_sgg_prompt(sgg_results[0])
+            verbalization_ocr = make_ocr_prompt(ocr_results[0])
+            
+            # Create auxiliary prompt
+            verbalization_aux = make_human_string(
+                verbalization_seg, 
+                verbalization_od, 
+                verbalization_sgg, 
+                verbalization_ocr
+            )
 
+            # Create system prompt and masks
+            moai_prompt, _, im_mask = make_system_prompt(processor, target_device, self.config.ignore_index)
+            moai_prompt, im_mask = demo_make_and_add_prompt_and_im_mask(
+                moai_prompt=moai_prompt,
+                im_mask=im_mask,
+                prompt=prompt,
+                processor=processor,
+                device=target_device
+            )
+            
+            # Create language mask
+            lang_mask = 1 - im_mask
 
-        # making batched moai prompt
-        batched_verb_prompt=[verbalization_aux]
-        batched_panoptic_map = [torch.from_numpy(panoptic_map).permute(2, 0, 1)]
-        batched_moai_prompt=[moai_prompt]
-        batched_im_mask=[im_mask.flip(dims=[0])]
-        batched_lang_mask=[lang_mask.flip(dims=[0])]
-        
-        '''For Final Outputs'''
-        moai_inputs = processor(batched_moai_prompt, padding='longest', return_tensors="pt")
+            # Prepare batched inputs
+            batched_verb_prompt = [verbalization_aux]
+            batched_panoptic_map = [torch.from_numpy(panoptic_map).permute(2, 0, 1)]
+            batched_moai_prompt = [moai_prompt]
+            batched_im_mask = [im_mask.flip(dims=[0])]
+            batched_lang_mask = [lang_mask.flip(dims=[0])]
+            
+            # Process inputs for model
+            moai_inputs = processor(batched_moai_prompt, padding='longest', return_tensors="pt")
+            input_ids = moai_inputs.input_ids.to(target_device)
+            pixel_values = self.image_processor(image.unsqueeze(0)).to(target_device)
+            
+            # Process verb embeddings
+            verb_tokens = processor(
+                batched_verb_prompt, 
+                padding='longest', 
+                return_tensors="pt"
+            ).input_ids.to(target_device)
+            verb_embeds = self.get_input_embeddings()(verb_tokens)
+            
+            # Process map embeddings
+            with torch.inference_mode():
+                self.vit.vision_tower.eval()
+                panoptic_tensor = torch.stack(batched_panoptic_map).to(torch.float16).to(target_device)
+                processed_maps = self.image_processor(panoptic_tensor).to(target_device)
+                map_embeds = self.vision_proj(self.vit(processed_maps))
+                
+            # Combine embeddings
+            aux_embeds = torch.cat([verb_embeds, map_embeds], dim=1)
+            
+            # Prepare attention and masks
+            attention_mask = moai_inputs.attention_mask.to(target_device)
+            im_mask = torch.nn.utils.rnn.pad_sequence(
+                batched_im_mask, 
+                batch_first=True, 
+                padding_value=0
+            ).flip(dims=[1]).bool().to(target_device)
+            
+            lang_mask = torch.nn.utils.rnn.pad_sequence(
+                batched_lang_mask, 
+                batch_first=True, 
+                padding_value=0
+            ).flip(dims=[1]).bool().to(target_device)
 
-        # [1] input_ids
-        input_ids = moai_inputs.input_ids.to(device)
-
-        # [2] pixel values
-        pixel_values = self.image_processor(image.unsqueeze(0)).to(device)
-
-        # [3] aux embed
-        verb_embeds = self.get_input_embeddings()(processor(batched_verb_prompt, padding='longest', return_tensors="pt").input_ids)
-        with torch.inference_mode(): self.vit.vision_tower.eval(); map_embeds = self.vision_proj(self.vit(self.image_processor(torch.stack(batched_panoptic_map).to(torch.float16)).to(device)))
-        aux_embeds = torch.cat([verb_embeds, map_embeds], dim=1)
-        
-        # [4] attention_mask
-        attention_mask = moai_inputs.attention_mask.to(device)
-
-        # [5] im_mask
-        im_mask = torch.nn.utils.rnn.pad_sequence(batched_im_mask, batch_first=True, padding_value=0).flip(dims=[1]).bool() # padding left
-        
-        # [6] lang_mask
-        lang_mask = torch.nn.utils.rnn.pad_sequence(batched_lang_mask, batch_first=True, padding_value=0).flip(dims=[1]).bool() # padding left
-
-        return {"input_ids": input_ids, 
-                "pixel_values": pixel_values, 
-                "aux_embeds": aux_embeds, 
-                "attention_mask": attention_mask, 
-                "im_mask": im_mask, 
+            return {
+                "input_ids": input_ids,
+                "pixel_values": pixel_values,
+                "aux_embeds": aux_embeds,
+                "attention_mask": attention_mask,
+                "im_mask": im_mask,
                 "lang_mask": lang_mask,
-                "mode": mode}
+                "mode": mode
+            }
 
 
     def forward(
